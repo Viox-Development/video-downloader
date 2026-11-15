@@ -145,8 +145,7 @@ jobs:
           key: ffmpeg-win64-gpl-shared-v1
 
       - name: ffmpeg indir
-        if: steps.ver.outputs.skip != 'true'
-        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        if: steps.ver.outputs.skip != 'true' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip'
