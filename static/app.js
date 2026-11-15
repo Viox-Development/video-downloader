@@ -131,22 +131,22 @@ async function refreshUpdateStatus() {
         const btn = document.getElementById('appUpdateBtn');
         const hint = document.getElementById('updateHint');
         if (s.staged_version) {
-            // Otomatik guncelleme indirmeyi bitirmis: kurulum bir sonraki
-            // acilista kendiliginden yapilacak.
+            // Otomatik guncelleme indirmeyi bitirmis: bir sonraki acilista
+            // kendiliginden uygulanacak.
             btn.style.display = '';
             btn.classList.add('is-highlight');
-            btn.textContent = 'Şimdi kur';
-            hint.textContent = 'v' + s.staged_version + ' indirildi. Uygulamayı ' +
-                'bir dahaki açışınızda kendiliğinden kurulacak.';
+            btn.textContent = 'Şimdi güncelle';
+            hint.textContent = 'v' + s.staged_version + ' hazır. Uygulamayı ' +
+                'bir dahaki açışınızda birkaç saniyede kendiliğinden güncellenecek.';
         } else if (appUpdateInfo) {
             btn.style.display = '';
             btn.classList.add('is-highlight');
             btn.textContent = 'v' + appUpdateInfo.version + ' yükle';
             hint.textContent = s.auto_update === false
                 ? 'Yeni sürüm hazır: v' + appUpdateInfo.version +
-                  '. İndirilip kurulum başlatılacak, uygulama kapanacak.'
+                  '. Sadece değişen dosyalar inecek, uygulama yeniden açılacak.'
                 : 'Yeni sürüm indiriliyor: v' + appUpdateInfo.version +
-                  '. İndirme bitince bir dahaki açılışta kurulacak.';
+                  '. İndirme bitince bir dahaki açılışta uygulanacak.';
         } else {
             btn.style.display = 'none';
         }
@@ -179,11 +179,10 @@ async function updateYtdlp() {
 }
 
 async function installAppUpdate() {
-    if (!appUpdateInfo) return;
     const btn = document.getElementById('appUpdateBtn');
     btn.disabled = true;
     btn.textContent = 'İndiriliyor...';
-    showToast('Güncelleme indiriliyor, bu biraz sürebilir...', 'info');
+    showToast('Güncelleme indiriliyor...', 'info');
     try {
         const r = await fetch('/api/update/app', { method: 'POST' });
         const res = await r.json();
@@ -191,6 +190,9 @@ async function installAppUpdate() {
             showToast(res.error, 'error');
             btn.disabled = false;
             btn.textContent = 'Yeniden dene';
+        } else if (res.status === 'patch_started') {
+            btn.textContent = 'Güncelleniyor...';
+            showToast('Uygulama kapanıp yeni sürümle açılacak', 'success');
         } else {
             btn.textContent = 'Kurulum açılıyor...';
         }

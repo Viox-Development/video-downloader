@@ -1661,7 +1661,8 @@ def check_app_update_async():
         if not info or not updater.get_auto_update():
             return
 
-        # Aktif indirme varken ~70 MB'lik kurulumu cekmeyelim; 30 dk boyunca
+        # Aktif indirme varken guncellemeyi cekmeyelim (yama tutmazsa 80 MB'lik
+        # kurulum inebilir); 30 dk boyunca
         # bos an kollanir, bulunamazsa bir sonraki aciliSta tekrar denenir.
         for _ in range(60):
             if not _has_active_download():
@@ -1731,24 +1732,37 @@ def update_ytdlp_now():
 
 @app.route("/api/update/app", methods=["POST"])
 def update_app_now():
-    """Kurulum dosyasini indirip calistirir; uygulama kapanir."""
+    """Guncellemeyi simdi uygula; uygulama kapanip yeni surumle acilir.
+
+    Yama varsa sadece degisen dosyalar iner ve birkac saniyede yerine
+    konur. Yoksa (ya da yama tutmazsa) kurulum sihirbazi acilir.
+    """
     with _app_update_lock:
         info = _app_update_info
 
     # Otomatik guncelleme zaten indirip DOGRULAMIS olabilir; tekrar indirme.
     staged = updater.staged_update()
-    if staged:
-        path = staged["path"]
-    elif not info:
-        return jsonify({"error": "Guncelleme yok"}), 400
-    else:
+    if not staged:
+        if not info:
+            return jsonify({"error": "Guncelleme yok"}), 400
         try:
-            path = updater.download_app_installer(info["url"],
-                                                  info.get("sha256_url"))
+            staged = updater.stage_app_update(info)
         except Exception as e:
             return jsonify({"error": "Indirilemedi: %s" % e}), 500
+        if not staged:
+            return jsonify({"error": "Guncelleme hazirlanamadi"}), 500
+
+    if staged.get("kind") == "patch":
+        def apply_patch():
+            time.sleep(1)
+            if updater.apply_staged_update(staged):
+                os._exit(0)
+        threading.Thread(target=apply_patch, daemon=True).start()
+        return jsonify({"status": "patch_started"})
 
     # Kurulum sihirbazini baslat, sonra uygulamadan cik ki dosyalar serbest kalsin
+    path = staged["path"]
+
     def launch():
         time.sleep(1)
         try:

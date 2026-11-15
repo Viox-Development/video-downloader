@@ -31,6 +31,7 @@ on:
       - "icon.ico"
       - "requirements.txt"
       - "static/**"
+      - "tools/**"
       - ".github/workflows/release.yml"
   workflow_dispatch:
     inputs:
@@ -211,6 +212,12 @@ jobs:
           Copy-Item ffmpeg "dist\Video Downloader\ffmpeg" -Recurse
           Copy-Item jsruntime "dist\Video Downloader\jsruntime" -Recurse
 
+      - name: Yama dosyalarini uret (manifest + app-files.zip)
+        if: steps.ver.outputs.skip != 'true'
+        # Kurulum paketinden ONCE: update_manifest.json kurulumun icine de
+        # girmeli ki yeni kuranlarin ilk yamasi hash'leme gerektirmesin.
+        run: python tools/update_bundle.py "${{ steps.ver.outputs.version }}" "dist\Video Downloader" "dist\update"
+
       - name: Inno Setup kur
         if: steps.ver.outputs.skip != 'true'
         run: choco install innosetup -y --no-progress
@@ -248,12 +255,17 @@ jobs:
           $exists = gh release view "v$v" 2>$null
           if ($LASTEXITCODE -eq 0) {
             gh release upload "v$v" "dist\Video Downloader Kurulum.exe" `
-              "dist\SHA256SUMS.txt" --clobber
+              "dist\SHA256SUMS.txt" "dist\update\update-manifest.json" `
+              "dist\update\app-files.zip" --clobber
           } else {
             # --target: otomatik surumde etiket henuz yok; derlenen commit'e
             # olusturulsun. Etiket push'unda etiket zaten var, yok sayilir.
+            # SHA256SUMS'ta kurulumun satiri ILK kalmali: eski surumler
+            # dosyadaki ilk hash'i okuyor. Yama dosyalari kendi hash'lerini
+            # manifestte tasiyor.
             gh release create "v$v" "dist\Video Downloader Kurulum.exe" `
-              "dist\SHA256SUMS.txt" --title "v$v" --notes $notes --latest `
+              "dist\SHA256SUMS.txt" "dist\update\update-manifest.json" `
+              "dist\update\app-files.zip" --title "v$v" --notes $notes --latest `
               --target $env:GITHUB_SHA
           }
 
