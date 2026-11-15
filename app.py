@@ -3,6 +3,7 @@ Video Downloader - Backend Server
 Supports YouTube, Instagram, TikTok and 1000+ platforms via yt-dlp
 """
 
+import contextlib
 import os
 import shutil
 import re
@@ -804,7 +805,9 @@ def extract_with_cookie_fallback(url, base_opts, browser_pref="auto", download=F
         err = None
         for deneme in range(TRANSIENT_RETRIES + 1):
             try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
+                lock = (_cookiefile_lock if opts.get("cookiefile")
+                        else contextlib.nullcontext())
+                with lock, yt_dlp.YoutubeDL(opts) as ydl:
                     if seed_tiktok:
                         _seed_tiktok_cookies(ydl, url)
                     info = ydl.extract_info(url, download=download)
@@ -924,6 +927,12 @@ def extract_with_cookie_fallback(url, base_opts, browser_pref="auto", download=F
     # Cerez cekme hatalari (DPAPI/kilit) yerine asil "giris gerekli" hatasini goster
     raise login_err or last_err
 
+
+# Toplu indirme ayni anda birkac video indirir. yt-dlp cerez dosyasini is
+# bitince GERI YAZAR; iki indirme ayni anda yazarsa giris cerezleri bozulup
+# kullanici cikis yapmis gibi olur. Cerez dosyasiyla yapilan denemeler bu
+# yuzden tek tek calisir (cerezsiz denemeler paralel kalir).
+_cookiefile_lock = threading.Lock()
 
 _ytdlp_refreshing = threading.Lock()
 _ytdlp_refreshed = False
