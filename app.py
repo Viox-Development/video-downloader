@@ -595,6 +595,128 @@ def _seed_tiktok_cookies(ydl, url):
         _log_attempt(url, "tiktok-cerez-tohumu", e)
 
 
+# ---- TikTok koleksiyonunu sayfa sayfa cekme --------------------------------
+# yt-dlp'nin koleksiyon cikaricisi TikTok "hasMore: false" dedigi anda durur
+# ve bos sayfayi tekrar denemez. Kullanicinin baglantisinda TikTok, arka
+# arkaya gelen isteklerde 7. sayfada ogesiz bir "bitti" cevabi verdi: 438
+# videoluk koleksiyonun sadece ilk 6 sayfasi (168 video) geldi, hata da
+# vermedi. Cevapta toplam video sayisi yok, yani eksiklik disaridan
+# anlasilmiyor. Burada:
+#   * sayfalar arasinda kisa bekleme,
+#   * ogesiz sayfa supheli sayilir; artan aralarla tekrar istenir,
+#   * yine olmazsa giris cerezleriyle kalinan yerden devam edilir,
+#   * hala eksikse liste "partial" isaretlenir, arayuz uyarir.
+TIKTOK_COLLECTION_API = "https://www.tiktok.com/api/collection/item_list/"
+COLLECTION_PAGE_DELAY = 0.4
+COLLECTION_RETRY_DELAYS = (1.5, 3, 6, 10)
+COLLECTION_MAX_PAGES = 300
+
+
+def _collection_entry(video):
+    vid = str(video.get("id") or "")
+    if not vid:
+        return None
+    author = (video.get("author") or {}).get("uniqueId") or "_"
+    v = video.get("video") or {}
+    return {
+        "id": vid,
+        "url": f"https://www.tiktok.com/@{author}/video/{vid}",
+        "title": (video.get("desc") or "").strip() or f"TikTok {vid}",
+        "duration": v.get("duration") or 0,
+        "thumbnail": v.get("cover") or "",
+        "uploader": author,
+    }
+
+
+def _collection_pages(url, collection_id, start_cursor, cookiefile=None):
+    """start_cursor'dan itibaren sayfalari cek.
+
+    Dondurur: (ogeler, kalinan_cursor, tamamlandi_mi).
+    """
+    from urllib.parse import urlencode
+    from yt_dlp.networking import Request
+    ext = {}
+    if has_impersonate_support():
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        ext["impersonate"] = ImpersonateTarget.from_str("chrome")
+    opts = {"quiet": True, "no_warnings": True, "socket_timeout": 15}
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+
+    items, cursor = [], start_cursor
+    label = "koleksiyon" + ("+cerez" if cookiefile else "")
+    with _cookiefile_lock if cookiefile else contextlib.nullcontext(), \
+            yt_dlp.YoutubeDL(opts) as ydl:
+        _seed_tiktok_cookies(ydl, url)
+        for _page in range(COLLECTION_MAX_PAGES):
+            page_items, data = [], None
+            for delay in (0,) + COLLECTION_RETRY_DELAYS:
+                if delay:
+                    time.sleep(delay)
+                try:
+                    q = urlencode({"aid": "1988", "collectionId": collection_id,
+                                   "count": 30, "cursor": cursor, "sourceType": "113"})
+                    req = Request(f"{TIKTOK_COLLECTION_API}?{q}",
+                                  headers={"Referer": url}, extensions=ext)
+                    data = json.loads(ydl.urlopen(req).read().decode("utf-8"))
+                except Exception as e:
+                    _log_attempt(url, label, f"cursor {cursor}: {e}")
+                    data = None
+                    continue
+                page_items = data.get("itemList") or []
+                if page_items:
+                    break
+                # Ogesiz cevap: ya gercekten bos koleksiyon ya da TikTok'un
+                # kisitlamasi. Ikisini ayirmanin yolu tekrar sormak.
+                _log_attempt(url, label, "cursor %s: bos sayfa (hasMore=%s, status=%s)"
+                             % (cursor, data.get("hasMore"), data.get("statusCode")))
+            if not page_items:
+                return items, cursor, False
+            items.extend(page_items)
+            if not data.get("hasMore"):
+                return items, cursor, True
+            try:
+                nxt = int(data.get("cursor"))
+            except (TypeError, ValueError):
+                nxt = cursor + len(page_items)
+            if nxt <= cursor:
+                nxt = cursor + len(page_items)
+            cursor = nxt
+            time.sleep(COLLECTION_PAGE_DELAY)
+    return items, cursor, False
+
+
+def fetch_tiktok_collection(url):
+    """TikTok koleksiyonunu playlist sozlugu olarak dondurur (yt-dlp bicimine yakin)."""
+    m = re.search(r'tiktok\.com/@(?P<user>[\w.-]+)/collection/(?P<title>[^/?#]+)-(?P<id>\d+)', url)
+    if not m:
+        raise ValueError("koleksiyon linki taninmadi")
+    cid = m.group("id")
+    raw, cursor, complete = _collection_pages(url, cid, 0)
+    if not complete and os.path.isfile(COOKIE_FILE):
+        more, cursor, complete = _collection_pages(url, cid, cursor, COOKIE_FILE)
+        raw += more
+
+    entries, seen = [], set()
+    for video in raw:
+        e = _collection_entry(video)
+        if e and e["id"] not in seen:
+            seen.add(e["id"])
+            entries.append(e)
+    if not entries:
+        raise yt_dlp.utils.DownloadError(TIKTOK_EMPTY_COLLECTION)
+    _log_attempt(url, "koleksiyon", "%d video, %s" % (
+        len(entries), "tamam" if complete else "EKSIK (cursor %s)" % cursor))
+    return {
+        "_type": "playlist", "id": cid,
+        "title": "%s-%s" % (m.group("user"), m.group("title")),
+        "entries": entries, "extractor": "tiktok:collection",
+        "extractor_key": "TikTokCollection", "webpage_url": url,
+        "thumbnail": entries[0].get("thumbnail", ""),
+        "partial": not complete,
+    }
+
+
 def _is_extractor_response_error(msg):
     """TikTok'un web sayfasindan gecerli veri alinamadigini gosteren hata."""
     m = str(msg).lower()
@@ -1230,7 +1352,17 @@ def get_video_info():
             "noplaylist": True,
         }
 
-        info, _ = extract_with_cookie_fallback(url, ydl_opts, cookies_browser)
+        info = None
+        if _is_tiktok_collection_url(url):
+            # Kendi sayfalamamiz; yt-dlp'ninki bos sayfada erken duruyordu.
+            # Tamamen tutmazsa (orn. ilk sayfa bile gelmedi) eski yola dus.
+            try:
+                info = fetch_tiktok_collection(url)
+            except Exception as e:
+                _log_attempt(url, "koleksiyon", e)
+                info = None
+        if info is None:
+            info, _ = extract_with_cookie_fallback(url, ydl_opts, cookies_browser)
 
         if info is None:
             return jsonify({"error": "Video bilgisi alınamadı"}), 400
@@ -1419,6 +1551,8 @@ def get_video_info():
             "is_playlist": is_playlist,
             "playlist_items": playlist_items,
             "in_playlist": _playlist_url_for(url) if not is_playlist else None,
+            # TikTok listenin bir kismini verdiyse kullanici bilsin
+            "playlist_partial": bool(info.get("partial")),
         }
 
         return jsonify(result)

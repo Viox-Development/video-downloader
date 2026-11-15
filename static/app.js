@@ -481,6 +481,10 @@ function renderVideoInfo(data) {
     // Playlist rendering
     if (data.is_playlist && data.playlist_items && data.playlist_items.length > 0) {
         playlistItems = data.playlist_items;
+        if (data.playlist_partial) {
+            showToast(`TikTok listenin tamamını vermedi: ${playlistItems.length} video alınabildi. ` +
+                      'Birkaç dakika sonra tekrar deneyin ya da TikTok\'a giriş yapın.', 'warning');
+        }
         document.getElementById('playlistSection').style.display = 'block';
         document.getElementById('trimmerGroup').style.display = 'none'; // Trimming disabled for batch
         
