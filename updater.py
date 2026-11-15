@@ -816,51 +816,167 @@ def stage_app_update(info=None, progress=None, force=False):
     return record
 
 
-# Yamayi uygulayan betik. Calisan exe ve _internal'daki DLL'ler kilitli
-# oldugu icin dosyalari uygulama kapandiktan SONRA ayri bir surec koyar.
-# Yollar ortam degiskenleriyle gelir: Turkce karakterli kullanici klasorleri
-# (C:\Users\Şule) cmd betiginin kod sayfasina takilmasin.
-#  * Once exe HARIC her sey kopyalanir, en son exe. Ilk adim yarida kalirsa
-#    eski exe yerinde kalir; surum eski gorunur ve yama tekrar denenir.
-#  * robocopy cikis kodu 8 ve uzeri hata demek (0-7 basari cesitleri).
-#  * Kurulu programlar listesindeki surum de guncellenir.
-_APPLY_CMD = r"""@echo off
-setlocal
-:wait
-tasklist /FI "PID eq %VD_PID%" /NH 2>nul | find " %VD_PID% " >nul
-if not errorlevel 1 (
-  ping -n 2 127.0.0.1 >nul
-  goto wait
-)
-robocopy "%VD_SRC%" "%VD_APP%" /E /XF "%VD_EXE_NAME%" /R:15 /W:1 /NP /NJH /NJS /NFL /NDL >nul
-if errorlevel 8 goto fail
-if exist "%VD_SRC%\%VD_EXE_NAME%" (
-  robocopy "%VD_SRC%" "%VD_APP%" "%VD_EXE_NAME%" /R:15 /W:1 /NP /NJH /NJS /NFL /NDL >nul
-  if errorlevel 8 goto fail
-)
-for /f "usebackq delims=" %%F in ("%VD_DELETE%") do if exist "%VD_APP%\%%F" del /f /q "%VD_APP%\%%F"
-reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{9C4E6A2F-3B7D-4E8A-9F1C-2B8D51E04A67}_is1" /v DisplayVersion /d "%VD_VERSION%" /f >nul 2>&1
-echo ok> "%VD_RESULT%"
-goto relaunch
-:fail
-echo fail> "%VD_RESULT%"
-:relaunch
-start "" "%VD_APP%\%VD_EXE_NAME%"
-"""
+# ---- Yamayi uygulama ------------------------------------------------------
+#
+# Eski yontem: uygulama kapanir, ayri bir cmd betigi dosyalari robocopy ile
+# koyup uygulamayi yeniden acar. Kullanicinin bilgisayarinda betik hic
+# calismadi (launcher.log: uygulama kapandi, dosyalar degismedi, geri
+# acilmadi -- Ekim'deki sessiz kurulum denemeleri de ayni yerde dustu).
+#
+# Simdiki yontem dis betige guvenmiyor: Windows calisan bir exe'nin ya da
+# yuklu bir DLL'in USTUNE YAZDIRMAZ ama ADINI DEGISTIRTIR. Uygulama her
+# degisen dosyanin eskisini "<ad>.vdold" yapar, yenisini yerine kopyalar,
+# kendini yeniden baslatir. (PyInstaller exe'deki PYZ arsivini her okumada
+# acip kapatiyor; exe acik tutulmuyor.) Herhangi bir adim tutmazsa yapilan
+# her sey geri alinir, eski surum saglam kalir. .vdold dosyalari bir sonraki
+# acilista silinir (o an hala yuklu olduklari icin simdi silinemezler).
+
+OLD_SUFFIX = ".vdold"
 
 
-def _spawn_detached(args, env=None):
+def _log_update(*parts):
+    """launcher.log'a yaz (launcher'in _log'u ile ayni dosya)."""
+    try:
+        d = user_data_dir()
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "launcher.log"), "a", encoding="utf-8") as f:
+            f.write("%s  [yama] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                        " ".join(str(p) for p in parts)))
+    except Exception:
+        pass
+
+
+def _move_aside(path):
+    """path'i path.vdold yap; eski bir .vdold kalmissa once onu temizle."""
+    aside = path + OLD_SUFFIX
+    if os.path.exists(aside):
+        try:
+            os.remove(aside)
+        except OSError:
+            # Onceki guncellemeden kalan ve hala yuklu olan bir kopya olabilir
+            n = 2
+            while os.path.exists("%s%s%d" % (path, OLD_SUFFIX, n)):
+                n += 1
+            aside = "%s%s%d" % (path, OLD_SUFFIX, n)
+    os.rename(path, aside)
+    return aside
+
+
+def apply_patch_in_place(staged, base=None):
+    """Hazirlanan yamayi kurulum klasorune uygular. Basarisizsa geri alir.
+
+    Dondurur: True (uygulandi) ya da False (hicbir sey degismedi).
+    """
+    base = base or app_dir()
+    if not base:
+        return False
+    src_root = os.path.join(staged["path"], "files")
+    rels = []
+    for root, _dirs, names in os.walk(src_root):
+        for name in names:
+            rels.append(os.path.relpath(os.path.join(root, name), src_root))
+    try:
+        with open(os.path.join(staged["path"], "delete.txt"), "r", encoding="utf-8") as f:
+            deletes = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+    except OSError:
+        deletes = []
+    # Manifest en son yazilsin: yarida kalan bir guncelleme "guncel" sanilmasin.
+    # exe ondan hemen once: surum numarasi exe'nin icinde.
+    def order(rel):
+        low = rel.replace("\\", "/").lower()
+        return (low == MANIFEST_NAME, low.endswith(".exe") and "/" not in low, low)
+    rels.sort(key=order)
+
+    undo = []   # (yeni_dosya_ya_da_None, kenara_alinan_ya_da_None)
+    try:
+        for rel in rels:
+            dst = os.path.join(base, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            aside = _move_aside(dst) if os.path.exists(dst) else None
+            undo.append((dst, aside))
+            shutil.copy2(os.path.join(src_root, rel), dst)
+        for rel in deletes:
+            dst = os.path.join(base, rel.replace("\\", os.sep).replace("/", os.sep))
+            if os.path.isfile(dst):
+                undo.append((None, _move_aside(dst)))
+    except Exception as e:
+        _log_update("uygulanamadi, geri aliniyor:", repr(e))
+        for dst, aside in reversed(undo):
+            try:
+                if dst and os.path.exists(dst):
+                    os.remove(dst)
+            except OSError:
+                pass
+            try:
+                if aside:
+                    target = dst or aside[:aside.rindex(OLD_SUFFIX)]
+                    os.rename(aside, target)
+            except OSError as e2:
+                _log_update("geri alinamadi:", aside, repr(e2))
+        state = _read_state()
+        state["last_patch_error"] = "%s uygulama: %s" % (staged.get("version"), e)
+        _write_state(state)
+        return False
+
+    _log_update("uygulandi:", staged.get("version"), len(rels), "dosya,",
+                len(deletes), "silindi")
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+            r"\{9C4E6A2F-3B7D-4E8A-9F1C-2B8D51E04A67}_is1",
+            0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, staged["version"])
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+    return True
+
+
+def cleanup_old_files(base=None):
+    """Onceki yamadan kalan .vdold dosyalarini sil (artik yuklu degiller)."""
+    base = base or app_dir()
+    if not base or not os.path.isdir(base):
+        return 0
+    removed = 0
+    for root, _dirs, names in os.walk(base):
+        for name in names:
+            if OLD_SUFFIX in name:
+                try:
+                    os.remove(os.path.join(root, name))
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
+def _child_env():
+    env = dict(os.environ)
+    # PyInstaller: donmus bir uygulama kendi exe'sini baslatirken alt surecin
+    # ust surecin ortam degiskenlerini (_PYI_*) devralmamasi icin.
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
+def _spawn_detached(args, env=None, shell_string=None):
     flags = 0
-    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
         flags |= getattr(subprocess, name, 0)
-    subprocess.Popen(args, creationflags=flags, close_fds=True, env=env)
+    subprocess.Popen(shell_string if shell_string is not None else args,
+                     creationflags=flags, close_fds=True, env=env or _child_env())
+
+
+def relaunch(exe):
+    """Yeni exe'yi baslat; o, bu surec kapanana kadar bekler (--wait-pid)."""
+    _spawn_detached([exe, "--wait-pid", str(os.getpid())])
 
 
 def apply_staged_update(staged=None, relaunch_exe=None):
-    """Bekleyen guncellemeyi uygulatir. True donerse uygulama HEMEN kapanmalidir.
+    """Bekleyen guncellemeyi uygular. True donerse uygulama HEMEN kapanmalidir.
 
-    Dosyalari ayri bir surec degistirir (uygulama acikken kilitliler); is
-    bitince uygulama yeniden baslatilir.
+    Yama: dosyalar bu surecte yerine konur, yeni surum baslatilir.
+    Kurulum: sessiz kurulum ayri surecte calisir, bitince uygulamayi acar.
     """
     staged = staged or staged_update()
     if not staged or os.name != "nt":
@@ -876,6 +992,7 @@ def apply_staged_update(staged=None, relaunch_exe=None):
             state["app_checked_at"] = 0
             _write_state(state)
             clear_staged_update()
+            _log_update("iki deneme basarisiz, tam kuruluma geciliyor:", staged["version"])
         # Kurulum da iki kez tutmadiysa acilis dongusune girmemek icin
         # vazgec; kullanici Ayarlar'dan elle kurabilir.
         return False
@@ -885,37 +1002,32 @@ def apply_staged_update(staged=None, relaunch_exe=None):
     exe = relaunch_exe
     if exe is None and getattr(sys, "frozen", False):
         exe = sys.executable
-
-    try:
-        if staged.get("kind") == "patch":
-            if not exe:
-                return False
-            path = staged["path"]
-            script = os.path.join(path, "apply.cmd")
-            with open(script, "w", encoding="ascii", newline="\r\n") as f:
-                f.write(_APPLY_CMD)
-            env = dict(os.environ)
-            env.update({
-                "VD_PID": str(os.getpid()),
-                "VD_SRC": os.path.join(path, "files"),
-                "VD_APP": os.path.dirname(os.path.abspath(exe)),
-                "VD_EXE_NAME": os.path.basename(exe),
-                "VD_DELETE": os.path.join(path, "delete.txt"),
-                "VD_RESULT": os.path.join(path, "result.txt"),
-                "VD_VERSION": staged["version"],
-            })
-            _spawn_detached(["cmd", "/c", script], env=env)
-            return True
-
-        # Tam kurulum: cmd /c kurulum bitene kadar bekler, sonra uygulamayi
-        # yeniden acar. "&": kurulum basarisiz olsa bile uygulama geri gelsin.
-        cmdline = '"%s" %s' % (staged["path"], " ".join(SILENT_FLAGS))
-        if exe:
-            cmdline += ' & start "" "%s"' % exe
-        _spawn_detached(["cmd", "/c", cmdline])
-        return True
-    except Exception:
+    if not exe:
         return False
+
+    if staged.get("kind") == "patch":
+        if not apply_patch_in_place(staged):
+            return False
+        try:
+            relaunch(exe)
+        except Exception as e:
+            # Dosyalar yeni surumde; uygulama bu oturumda eski kodla devam
+            # eder, bir sonraki acilista yeni surum acilir.
+            _log_update("yeniden baslatilamadi:", repr(e))
+            return False
+        return True
+
+    # Tam kurulum. Komut tek bir dize olarak verilir: liste verilirse Python
+    # icteki tirnaklari \" diye kacirir, cmd bunu anlamaz ve komut bozulur
+    # (Ekim'deki "sessiz kurulum baslatilamadi" dongusu buydu).
+    # "&": kurulum basarisiz olsa bile uygulama geri gelsin.
+    inner = '"%s" %s & start "" "%s"' % (staged["path"], " ".join(SILENT_FLAGS), exe)
+    try:
+        _spawn_detached(None, shell_string='cmd /c "%s"' % inner)
+    except Exception as e:
+        _log_update("kurulum baslatilamadi:", repr(e))
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------
