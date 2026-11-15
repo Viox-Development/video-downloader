@@ -15,17 +15,34 @@ let isBatchDownloading = false;
 // Toplu indirme: her video bitince secilen klasore tasinir (pywebview).
 // Tarayicida (gelistirme) klasor secilemez; o zaman her dosya tarayici
 // indirmesi olarak verilir.
-let batch = { total: 0, done: 0, saved: 0, failed: 0, folder: null, cancelled: false };
+let batch = newBatch(0, null);
+// Ayni anda inen video sayisi. TikTok videolari kucuk (1-3 MB); tek tek
+// indirirken zamanin cogu her videonun bilgi cekme + baglanti kurma
+// beklemesinde geciyor, hat hizina hic cikilmiyor. 3'ten fazlasi TikTok'un
+// hiz sinirina (403/engel) takilma riskini artiriyor.
+const BATCH_CONCURRENCY = 3;
+
+function newBatch(total, folder) {
+    return { total: total, done: 0, saved: 0, failed: 0, folder: folder,
+             cancelled: false, active: new Set(), lastError: '' };
+}
 // Iptal basildi ama sunucu henuz task_id dondurmediyse, gelince iptal edilir
 let cancelRequested = false;
 
 async function cancelDownload() {
     cancelRequested = true;
     downloadQueue = [];
-    if (isBatchDownloading) batch.cancelled = true;
     const btn = document.getElementById('cancelBtn');
     btn.disabled = true;
     btn.textContent = 'İptal ediliyor...';
+    if (isBatchDownloading) {
+        batch.cancelled = true;
+        // Henuz task_id'si gelmemis olanlari isci, cevap gelince iptal eder
+        for (const slot of batch.active) {
+            if (slot.taskId) fetch(`/api/cancel/${slot.taskId}`, { method: 'POST' }).catch(() => {});
+        }
+        return;
+    }
     if (currentTaskId) {
         try { await fetch(`/api/cancel/${currentTaskId}`, { method: 'POST' }); } catch (e) {}
     }
@@ -38,12 +55,8 @@ function resetCancelBtn() {
     btn.textContent = 'İptal';
 }
 
-// Sunucu "cancelled" dedi
+// Sunucu "cancelled" dedi (tekli indirme; toplu indirme kendi akisinda)
 function handleCancelled() {
-    if (isBatchDownloading) {
-        processDownloadQueue();   // kuyruk bos: ozet gosterilir
-        return;
-    }
     hideSection('downloadProgress');
     document.getElementById('downloadBtn').disabled = false;
     resetCancelBtn();
@@ -621,7 +634,7 @@ async function startDownload() {
             if (!folder) { showToast('Kaydedilecek klasör seçilmedi.', 'warning'); return; }
         }
         downloadQueue = Array.from(checkedBoxes).map(cb => playlistItems[cb.value]);
-        batch = { total: downloadQueue.length, done: 0, saved: 0, failed: 0, folder: folder, cancelled: false };
+        batch = newBatch(downloadQueue.length, folder);
         resetCancelBtn();
         isBatchDownloading = true;
         document.getElementById('openFolderBtn').style.display = 'none';
@@ -631,7 +644,7 @@ async function startDownload() {
         showSection('downloadProgress');
         document.getElementById('downloadProgress').scrollIntoView({ behavior: 'smooth', block: 'end' });
         
-        processDownloadQueue();
+        runBatch();
         return;
     }
 
@@ -667,8 +680,7 @@ async function triggerSingleDownload(url) {
         const data = await res.json();
         if (!res.ok) { 
             showToast(data.error || 'İndirme başlatılamadı', 'error'); 
-            if(!isBatchDownloading) downloadBtn.disabled = false;
-            else batchItemDone(null, false);
+            downloadBtn.disabled = false;
             return; 
         }
 
@@ -684,35 +696,127 @@ async function triggerSingleDownload(url) {
         trackProgress(data.task_id);
     } catch (err) {
         showToast('İndirme başlatılamadı: ' + err.message, 'error');
-        if(!isBatchDownloading) downloadBtn.disabled = false;
-        else batchItemDone(null, false);
+        downloadBtn.disabled = false;
     }
 }
 
-// Bir liste ogesi bitti (basarili ya da degil): kaydet, sayaci ilerlet,
-// siradakine gec.
-async function batchItemDone(taskId, ok) {
-    if (batch.cancelled && !ok) { processDownloadQueue(); return; }
-    batch.done++;
-    if (ok && taskId) {
-        if (batch.folder) {
-            let name = null;
-            try { name = await window.pywebview.api.save_to_batch_folder(taskId); } catch (e) {}
-            if (name) batch.saved++; else batch.failed++;
-        } else {
-            // Tarayici modu: dosyayi tarayici indirmesi olarak ver
-            const link = document.createElement('a');
-            link.href = `/api/file/${taskId}`;
-            link.download = '';
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-            batch.saved++;
-        }
-    } else {
-        batch.failed++;
+// ===== TOPLU INDIRME (paralel) =====
+// Bir gorevin sonucunu bekler: completed / error / cancelled / unknown.
+function waitForTask(taskId, onProgress) {
+    return new Promise(resolve => {
+        const es = new EventSource(`/api/progress/${taskId}`);
+        let finished = false;
+        es.onmessage = (ev) => {
+            const p = JSON.parse(ev.data);
+            onProgress(p);
+            if (['completed', 'error', 'cancelled', 'unknown'].includes(p.status)) {
+                finished = true;
+                es.close();
+                resolve(p);
+            }
+        };
+        es.onerror = () => {
+            es.close();
+            if (finished) return;
+            // Baglanti koptu: kisa bir aradan sonra yeniden baglan
+            setTimeout(() => waitForTask(taskId, onProgress).then(resolve), 1000);
+        };
+    });
+}
+
+function renderBatchProgress() {
+    let partial = 0, speed = 0;
+    for (const slot of batch.active) {
+        partial += (slot.percent || 0) / 100;
+        speed += slot.speed || 0;
     }
-    processDownloadQueue();
+    const pct = batch.total ? Math.min(100, Math.round((batch.done + partial) / batch.total * 1000) / 10) : 0;
+    document.getElementById('progressPercent').textContent = pct + '%';
+    document.getElementById('progressBar').style.width = pct + '%';
+    let text = `${batch.done}/${batch.total} tamamlandı · ${batch.active.size} aktif`;
+    if (speed) text += ` · ${formatBytes(speed)}/sn`;
+    document.getElementById('progressSpeed').textContent = text;
+    const names = [...batch.active].map(s => s.title).filter(Boolean);
+    document.getElementById('progressEta').textContent = names.length ? names[0].slice(0, 60) : '';
+}
+
+async function saveBatchFile(taskId) {
+    if (batch.folder) {
+        try { return !!(await window.pywebview.api.save_to_batch_folder(taskId)); }
+        catch (e) { return false; }
+    }
+    // Tarayici modu: dosyayi tarayici indirmesi olarak ver
+    const link = document.createElement('a');
+    link.href = `/api/file/${taskId}`;
+    link.download = '';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    return true;
+}
+
+async function batchWorker() {
+    while (!batch.cancelled && downloadQueue.length > 0) {
+        const item = downloadQueue.shift();
+        const slot = { title: item.title, percent: 0, speed: 0, taskId: null };
+        batch.active.add(slot);
+        renderBatchProgress();
+        let status = 'error';
+        try {
+            const res = await fetch('/api/download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: item.url,
+                    mode: currentMode,
+                    quality: currentMode !== 'audio_only' ? String(selectedVideoQuality) : 'best',
+                    audio_quality: currentMode === 'audio_only' ? String(selectedAudioQuality) : 'best',
+                    audio_format: selectedAudioFormat,
+                    start_time: '', end_time: ''
+                })
+            });
+            const data = await res.json();
+            if (res.ok && data.task_id) {
+                slot.taskId = data.task_id;
+                if (batch.cancelled) fetch(`/api/cancel/${data.task_id}`, { method: 'POST' }).catch(() => {});
+                const final = await waitForTask(data.task_id, p => {
+                    slot.percent = p.status === 'downloading' ? (p.percent || 0) : slot.percent;
+                    slot.speed = p.status === 'downloading' ? (p.speed || 0) : 0;
+                    renderBatchProgress();
+                });
+                status = final.status;
+                if (status === 'completed') {
+                    if (await saveBatchFile(data.task_id)) batch.saved++;
+                    else { batch.failed++; batch.lastError = 'Dosya klasöre kaydedilemedi'; }
+                    addToHistory({
+                        title: final.title || item.title || 'İndirilen Dosya',
+                        platform: currentVideoData ? currentVideoData.platform : 'Bilinmeyen',
+                        thumbnail: currentVideoData ? currentVideoData.thumbnail : '',
+                        date: new Date().toISOString()
+                    });
+                } else if (status === 'error') {
+                    batch.failed++;
+                    batch.lastError = final.error || batch.lastError;
+                }
+            } else {
+                batch.failed++;
+                batch.lastError = data.error || batch.lastError;
+            }
+        } catch (e) {
+            batch.failed++;
+            batch.lastError = e.message;
+        }
+        batch.active.delete(slot);
+        if (status !== 'cancelled') batch.done++;
+        renderBatchProgress();
+    }
+}
+
+async function runBatch() {
+    renderBatchProgress();
+    const n = Math.min(BATCH_CONCURRENCY, downloadQueue.length);
+    await Promise.all(Array.from({ length: n }, () => batchWorker()));
+    finishBatch();
 }
 
 async function openBatchFolder() {
@@ -721,39 +825,31 @@ async function openBatchFolder() {
     }
 }
 
-function processDownloadQueue() {
-    if (downloadQueue.length === 0) {
-        isBatchDownloading = false;
-        document.getElementById('downloadBtn').disabled = false;
-        hideSection('downloadProgress');
-        resetCancelBtn();
-        let msg = batch.folder
-            ? `${batch.saved} video "${batch.folder}" klasörüne kaydedildi.`
-            : `${batch.saved} video indirildi.`;
-        if (batch.failed) msg += ` ${batch.failed} video indirilemedi.`;
-        if (batch.cancelled) {
-            msg = `İndirme iptal edildi (${batch.total} videodan ${batch.done} tanesi işlendi). ` + msg;
-            showToast('Toplu indirme iptal edildi', 'info');
-        } else {
-            showToast(batch.failed ? 'Toplu indirme bitti, bazı videolar indirilemedi' : 'Toplu indirme tamamlandı!',
-                      batch.failed ? 'warning' : 'success');
-        }
-        document.getElementById('successFilename').textContent = msg;
-        showSection('successMessage');
-        // Tek dosya kaydetme butonu toplu indirmede anlamsiz; klasoru ac goster
-        document.getElementById('saveFileBtn').style.display = 'none';
-        document.getElementById('openFolderBtn').style.display = batch.folder ? 'inline-flex' : 'none';
-        return;
+function finishBatch() {
+    downloadQueue = [];
+    isBatchDownloading = false;
+    document.getElementById('downloadBtn').disabled = false;
+    hideSection('downloadProgress');
+    resetCancelBtn();
+    let msg = batch.folder
+        ? `${batch.saved} video "${batch.folder}" klasörüne kaydedildi.`
+        : `${batch.saved} video indirildi.`;
+    if (batch.failed) {
+        msg += ` ${batch.failed} video indirilemedi`;
+        msg += batch.lastError ? ` (son hata: ${batch.lastError.slice(0, 150)}).` : '.';
     }
-    
-    const nextItem = downloadQueue.shift();
-    document.getElementById('progressPercent').textContent = '0%';
-    document.getElementById('progressBar').style.width = '0%';
-    document.getElementById('progressSpeed').textContent =
-        `${batch.done + 1}/${batch.total}: ${nextItem.title}`;
-    document.getElementById('progressEta').textContent = '';
-    
-    triggerSingleDownload(nextItem.url);
+    if (batch.cancelled) {
+        msg = `İndirme iptal edildi (${batch.total} videodan ${batch.done} tanesi işlendi). ` + msg;
+        showToast('Toplu indirme iptal edildi', 'info');
+    } else {
+        showToast(batch.failed ? 'Toplu indirme bitti, bazı videolar indirilemedi' : 'Toplu indirme tamamlandı!',
+                  batch.failed ? 'warning' : 'success');
+    }
+    document.getElementById('successFilename').textContent = msg;
+    showSection('successMessage');
+    // Tek dosya kaydetme butonu toplu indirmede anlamsiz; klasoru ac goster
+    document.getElementById('saveFileBtn').style.display = 'none';
+    document.getElementById('openFolderBtn').style.display = batch.folder ? 'inline-flex' : 'none';
 }
 
 // ===== PROGRESS TRACKING =====
@@ -775,26 +871,17 @@ function trackProgress(taskId) {
                 date: new Date().toISOString()
             });
 
-            if (isBatchDownloading) {
-                batchItemDone(taskId, true);
-            } else {
-                hideSection('downloadProgress');
-                showSuccess(progress);
-                document.getElementById('downloadBtn').disabled = false;
-            }
+            hideSection('downloadProgress');
+            showSuccess(progress);
+            document.getElementById('downloadBtn').disabled = false;
         } else if (progress.status === 'cancelled') {
             evtSource.close();
             handleCancelled();
         } else if (progress.status === 'error') {
             evtSource.close();
             showDownloadError(progress);
-            
-            if (isBatchDownloading) {
-                batchItemDone(taskId, false);
-            } else {
-                hideSection('downloadProgress');
-                document.getElementById('downloadBtn').disabled = false;
-            }
+            hideSection('downloadProgress');
+            document.getElementById('downloadBtn').disabled = false;
         }
     };
 
@@ -844,24 +931,17 @@ async function pollProgress(taskId) {
                             date: new Date().toISOString()
                         });
 
-                        if (isBatchDownloading) {
-                            batchItemDone(taskId, true);
-                        } else {
-                            hideSection('downloadProgress');
-                            showSuccess(progress);
-                            document.getElementById('downloadBtn').disabled = false;
-                        }
+                        hideSection('downloadProgress');
+                        showSuccess(progress);
+                        document.getElementById('downloadBtn').disabled = false;
                         return;
                     } else if (progress.status === 'cancelled') {
                         handleCancelled();
                         return;
                     } else if (progress.status === 'error') {
                         showDownloadError(progress);
-                        if (isBatchDownloading) batchItemDone(taskId, false);
-                        else {
-                            hideSection('downloadProgress');
-                            document.getElementById('downloadBtn').disabled = false;
-                        }
+                        hideSection('downloadProgress');
+                        document.getElementById('downloadBtn').disabled = false;
                         return;
                     }
                 }
@@ -869,8 +949,7 @@ async function pollProgress(taskId) {
         }
     } catch (err) {
         showToast('İlerleme takibi başarısız', 'error');
-        if (isBatchDownloading) batchItemDone(taskId, false);
-        else document.getElementById('downloadBtn').disabled = false;
+        document.getElementById('downloadBtn').disabled = false;
     }
 }
 
