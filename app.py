@@ -4,6 +4,7 @@ Supports YouTube, Instagram, TikTok and 1000+ platforms via yt-dlp
 """
 
 import os
+import shutil
 import re
 import sys
 import uuid
@@ -134,6 +135,23 @@ download_progress = {}
 
 # Lock for thread-safe progress updates
 progress_lock = threading.Lock()
+
+# Iptal istenen indirmeler. Ilerleme kancasi her parcada buraya bakar ve
+# yt-dlp'yi DownloadCancelled ile durdurur.
+_cancelled_tasks = set()
+
+
+class DownloadCancelledByUser(yt_dlp.utils.DownloadCancelled):
+    """Kullanici iptal etti; cerez/yeniden deneme yollarina girilmemeli.
+
+    yt-dlp DownloadCancelled'i sarmalamadan yukari firlatir; kendi
+    istisnamiz da ondan turedigi icin hata mesajina donusmeden bize ulasir.
+    """
+
+
+def _is_cancelled(task_id):
+    with progress_lock:
+        return task_id in _cancelled_tasks
 
 
 def _cleanup_stale_downloads(max_age_hours=24):
@@ -811,6 +829,11 @@ def extract_with_cookie_fallback(url, base_opts, browser_pref="auto", download=F
                 return info, opts
             except Exception as e:
                 err = e
+                if isinstance(e, (DownloadCancelledByUser,
+                                  yt_dlp.utils.DownloadCancelled)):
+                    # Iptal bir hata degil: cerezle/baska yoldan tekrar
+                    # denersek indirme bastan baslar.
+                    raise
                 if deneme < TRANSIENT_RETRIES and _is_transient_error(e):
                     time.sleep(TRANSIENT_BACKOFF * (deneme + 1))
                     continue
@@ -1084,10 +1107,50 @@ def build_download_name(title, ext):
     return f"{safe_title}_{stamp}{ext}"
 
 
+def _unique_path(folder, name):
+    """folder/name doluysa "ad (2).ext", "ad (3).ext"... dondurur."""
+    base, ext = os.path.splitext(name)
+    path = os.path.join(folder, name)
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(folder, f"{base} ({n}){ext}")
+        n += 1
+    return path
+
+
+def move_download_to(task_id, folder):
+    """Tamamlanan indirmeyi kullanicinin sectigi klasore gercek adiyla tasir.
+
+    Toplu indirmede kullaniciya her video icin "Kaydet" sordurulamaz; eskiden
+    dosyalar uygulama klasorundeki downloads/ altinda <uuid>.mp4 olarak
+    kaliyor ve 24 saat sonra acilista siliniyordu. Dondurur: kaydedilen
+    dosyanin adi ya da None.
+    """
+    if not folder or not os.path.isdir(folder):
+        return None
+    with progress_lock:
+        progress = dict(download_progress.get(task_id) or {})
+    filepath = progress.get("filepath")
+    if progress.get("status") != "completed" or not filepath \
+            or not os.path.exists(filepath):
+        return None
+    ext = os.path.splitext(filepath)[1]
+    # Klasorde zaten tarih/saat yok; liste ogesi icin sade baslik yeterli
+    name = (clean_filename(progress.get("title") or "")[:120] or "video") + ext
+    dest = _unique_path(folder, name)
+    shutil.move(filepath, dest)
+    with progress_lock:
+        if task_id in download_progress:
+            download_progress[task_id]["filepath"] = dest
+    return os.path.basename(dest)
+
+
 def get_progress_hook(task_id):
     """Create a progress hook for yt-dlp."""
     def hook(d):
         with progress_lock:
+            if task_id in _cancelled_tasks:
+                raise DownloadCancelledByUser("iptal edildi")
             if d['status'] == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
                 downloaded = d.get('downloaded_bytes', 0)
@@ -1473,7 +1536,12 @@ def download_video():
 
     def do_download():
         try:
+            if _is_cancelled(task_id):
+                raise DownloadCancelledByUser("iptal edildi")
             info, _ = extract_with_cookie_fallback(url, ydl_opts, cookies_browser, download=True)
+            if _is_cancelled(task_id):
+                # Iptal, indirme bittikten hemen sonra geldiyse
+                raise DownloadCancelledByUser("iptal edildi")
 
             if info and info.get("_type") == "playlist":
                 entries = info.get("entries", [])
@@ -1515,6 +1583,13 @@ def download_video():
                         "error": "İndirme başarısız"
                     }
         except Exception as e:
+            if _is_cancelled(task_id) or isinstance(
+                    e, (DownloadCancelledByUser, yt_dlp.utils.DownloadCancelled)):
+                _discard_task_files(task_id)
+                with progress_lock:
+                    _cancelled_tasks.discard(task_id)
+                    download_progress[task_id] = {"status": "cancelled"}
+                return
             error_str = str(e)
             # Handle Windows Defender/ffmpeg locking the file and preventing yt-dlp rename
             if "WinError 32" in error_str:
@@ -1580,7 +1655,7 @@ def get_progress(task_id):
 
             yield f"data: {json.dumps(progress)}\n\n"
 
-            if progress.get("status") in ("completed", "error", "unknown"):
+            if progress.get("status") in ("completed", "error", "unknown", "cancelled"):
                 break
 
             time.sleep(0.5)
@@ -1612,6 +1687,31 @@ def serve_file(task_id):
         as_attachment=True,
         download_name=download_name
     )
+
+
+def _discard_task_files(task_id):
+    """Iptal edilen indirmenin yarim dosyalarini (.part, .ytdl, parcalar) sil."""
+    try:
+        names = os.listdir(DOWNLOAD_DIR)
+    except OSError:
+        return
+    for f in names:
+        if f.startswith(task_id):
+            try:
+                os.remove(os.path.join(DOWNLOAD_DIR, f))
+            except OSError:
+                pass
+
+
+@app.route("/api/cancel/<task_id>", methods=["POST"])
+def cancel_download(task_id):
+    """Suren indirmeyi durdur. Kanca bir sonraki parcada yakalar."""
+    with progress_lock:
+        progress = download_progress.get(task_id)
+        if not progress or progress.get("status") in ("completed", "error", "cancelled"):
+            return jsonify({"status": progress.get("status") if progress else "unknown"})
+        _cancelled_tasks.add(task_id)
+    return jsonify({"status": "cancelling"})
 
 
 @app.route("/api/cleanup/<task_id>", methods=["DELETE"])

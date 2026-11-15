@@ -142,6 +142,7 @@ class Api:
     def __init__(self):
         self._window = None
         self._minimize_to_tray = False
+        self._batch_folder = None
 
     def set_minimize_to_tray(self, val):
         self._minimize_to_tray = bool(val)
@@ -248,6 +249,36 @@ class Api:
             except Exception:
                 return False
         return False
+
+    # ---- Toplu indirme: klasore kaydetme ----
+    # Klasor yolu JS'ten alinmaz; sadece burada, kullanicinin sectigi
+    # klasor olarak tutulur. Boylece sayfadaki bir betik dosyalari rastgele
+    # bir yere tasiyamaz.
+    def choose_batch_folder(self):
+        import webview
+        win = self._window if self._window else webview.windows[0]
+        result = win.create_file_dialog(webview.FOLDER_DIALOG)
+        if not result:
+            return None
+        folder = result[0] if isinstance(result, (list, tuple)) else result
+        self._batch_folder = folder
+        return folder
+
+    def save_to_batch_folder(self, task_id):
+        import app
+        try:
+            return app.move_download_to(task_id, self._batch_folder)
+        except Exception as e:
+            _log("[toplu] kaydedilemedi:", task_id, repr(e))
+            return None
+
+    def open_batch_folder(self):
+        import os
+        if self._batch_folder and os.path.isdir(self._batch_folder):
+            os.startfile(self._batch_folder)
+            return True
+        return False
+
 
 def create_tray_image():
     from PIL import Image, ImageDraw
