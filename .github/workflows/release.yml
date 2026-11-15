@@ -5,14 +5,33 @@
 # dusturuldugu anda herkesin uygulamasi kendini gunceller. Boylece artik
 # kimsenin kendi bilgisayarinda derleme yapmasi gerekmiyor.
 #
-# Calistirma: ya "v1.3.1" gibi bir etiket push edin, ya da Actions
-# sekmesinden "Run workflow" deyip surumu yazin.
+# Calistirma (uc yol):
+#   1. Otomatik: main'e uygulamanin kendisini degistiren bir commit girdiginde
+#      (PR merge dahil) son v* etiketinin patch numarasi bir artirilir
+#      (v1.3.6 -> v1.3.7) ve o surum yayinlanir. README gibi uygulamaya
+#      girmeyen dosyalar asagidaki "paths" listesinde olmadigi icin surum
+#      cikarmaz.
+#   2. "v1.4.0" gibi bir etiket push edin (minor/major atlamak icin).
+#   3. Actions sekmesinden "Run workflow" deyip surumu yazin.
 
 name: Release
 
 on:
   push:
     tags: ["v*"]
+    branches: [main]
+    # Sadece kuruluma giren dosyalar. Etiket push'u bu filtreden etkilenmez.
+    paths:
+      - "*.py"
+      - "*.pyw"
+      - "*.spec"
+      - "*.bat"
+      - "installer.iss"
+      - "version_info.txt"
+      - "icon.ico"
+      - "requirements.txt"
+      - "static/**"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
     inputs:
       version:
@@ -22,12 +41,23 @@ on:
 permissions:
   contents: write
 
+# Arka arkaya iki merge ayni surum numarasini hesaplamasin: isler sirayla
+# calisir, ikincisi birincinin olusturdugu etiketi gorur. Yarida kesmek
+# yarim bir release birakabilecegi icin iptal yok.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Son surumu bulmak icin etiketler gerekli
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/setup-python@v5
         with:
@@ -39,6 +69,26 @@ jobs:
         run: |
           if ($env:GITHUB_REF -like 'refs/tags/*') {
             $v = $env:GITHUB_REF -replace '^refs/tags/v?', ''
+          } elseif ($env:GITHUB_EVENT_NAME -eq 'push') {
+            # main'e push: bu commit zaten etiketliyse (elle etiket atilip
+            # main'e de push edildiyse) etiket isi o surumu derliyor, tekrar
+            # yayinlama.
+            $onHead = git tag --points-at HEAD --list 'v*'
+            if ($onHead) {
+              Write-Host "Bu commit zaten etiketli ($onHead), atlaniyor"
+              "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              exit 0
+            }
+            # Surum sirasina gore en buyuk v1.2.3 etiketi, patch + 1
+            $last = git tag --list 'v*' |
+              Where-Object { $_ -match '^v\d+\.\d+(\.\d+)?$' } |
+              Sort-Object { [version]($_.TrimStart('v')) } |
+              Select-Object -Last 1
+            if (-not $last) { throw "Hic v* etiketi yok; ilk surumu elle etiketleyin" }
+            $p = [version]($last.TrimStart('v'))
+            $patch = [Math]::Max($p.Build, 0) + 1
+            $v = "$($p.Major).$($p.Minor).$patch"
+            Write-Host "Son surum $last -> yeni surum v$v"
           } else {
             $v = '${{ inputs.version }}'.TrimStart('v')
           }
@@ -49,6 +99,7 @@ jobs:
           Write-Host "Surum: $v"
 
       - name: Surum numarasini dosyalara yaz
+        if: steps.ver.outputs.skip != 'true'
         shell: pwsh
         run: |
           $v = '${{ steps.ver.outputs.version }}'
@@ -62,6 +113,7 @@ jobs:
           Select-String -Path installer.iss -Pattern 'MyAppVersion'
 
       - name: Hata raporu adresini yaz
+        if: steps.ver.outputs.skip != 'true'
         shell: pwsh
         env:
           # Settings -> Secrets and variables -> Actions -> Variables -> REPORT_URL
@@ -77,6 +129,7 @@ jobs:
           }
 
       - name: Python bagimliliklari
+        if: steps.ver.outputs.skip != 'true'
         # [default] yt-dlp-ejs'i yt-dlp'nin bekledigi TAM surume sabitler;
         # ayri ayri kurulursa ikisinin en sonu birbirine uymayabilir.
         run: >
@@ -84,6 +137,7 @@ jobs:
           pystray pillow flask flask-cors "yt-dlp[default,curl-cffi]"
 
       - name: ffmpeg onbellegi
+        if: steps.ver.outputs.skip != 'true'
         id: ffmpeg-cache
         uses: actions/cache@v4
         with:
@@ -91,6 +145,7 @@ jobs:
           key: ffmpeg-win64-gpl-shared-v1
 
       - name: ffmpeg indir
+        if: steps.ver.outputs.skip != 'true'
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
@@ -105,6 +160,7 @@ jobs:
           Get-ChildItem ffmpeg | Select-Object -First 5 Name
 
       - name: quickjs indir (YouTube JS cozucu calistiricisi)
+        if: steps.ver.outputs.skip != 'true'
         shell: pwsh
         env:
           # Surum ve hash sabit: indirilen exe kullanicinin makinesinde
@@ -122,9 +178,11 @@ jobs:
           Write-Host "quickjs tamam ($h)"
 
       - name: Uygulamayi derle
+        if: steps.ver.outputs.skip != 'true'
         run: python -m PyInstaller "Video Downloader.spec" --clean --noconfirm
 
       - name: curl_cffi paketlendi mi
+        if: steps.ver.outputs.skip != 'true'
         shell: pwsh
         run: |
           # TikTok/Instagram impersonation'i bu pakete bagli; sessizce
@@ -134,6 +192,7 @@ jobs:
           Write-Host "curl_cffi tamam: $($hit[0].FullName)"
 
       - name: yt-dlp-ejs paketlendi mi ve surumu uyuyor mu
+        if: steps.ver.outputs.skip != 'true'
         shell: pwsh
         run: |
           # Girisli YouTube indirmeleri bu betiklere bagli. Eksikse ya da
@@ -147,15 +206,18 @@ jobs:
           Write-Host "yt-dlp-ejs $have tamam"
 
       - name: ffmpeg ve quickjs'i pakete kopyala
+        if: steps.ver.outputs.skip != 'true'
         shell: pwsh
         run: |
           Copy-Item ffmpeg "dist\Video Downloader\ffmpeg" -Recurse
           Copy-Item jsruntime "dist\Video Downloader\jsruntime" -Recurse
 
       - name: Inno Setup kur
+        if: steps.ver.outputs.skip != 'true'
         run: choco install innosetup -y --no-progress
 
       - name: Kurulum paketini olustur
+        if: steps.ver.outputs.skip != 'true'
         shell: pwsh
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /Q installer.iss
@@ -164,6 +226,7 @@ jobs:
           }
 
       - name: SHA256 saglama toplami
+        if: steps.ver.outputs.skip != 'true'
         shell: pwsh
         run: |
           # Uygulama indirdigi kurulumu bu dosyayla dogruluyor
@@ -175,6 +238,7 @@ jobs:
           Write-Host $h
 
       - name: Release yayinla
+        if: steps.ver.outputs.skip != 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -187,11 +251,15 @@ jobs:
             gh release upload "v$v" "dist\Video Downloader Kurulum.exe" `
               "dist\SHA256SUMS.txt" --clobber
           } else {
+            # --target: otomatik surumde etiket henuz yok; derlenen commit'e
+            # olusturulsun. Etiket push'unda etiket zaten var, yok sayilir.
             gh release create "v$v" "dist\Video Downloader Kurulum.exe" `
-              "dist\SHA256SUMS.txt" --title "v$v" --notes $notes --latest
+              "dist\SHA256SUMS.txt" --title "v$v" --notes $notes --latest `
+              --target $env:GITHUB_SHA
           }
 
       - name: Kurulum dosyasini is ciktisi olarak sakla
+        if: steps.ver.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: VideoDownloader-Kurulum-${{ steps.ver.outputs.version }}
