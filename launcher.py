@@ -333,10 +333,11 @@ def main():
             import updater
             staged = updater.staged_update() if updater.get_auto_update() else None
             if staged:
-                _log("[guncelleme] sessiz kurulum baslatiliyor:", staged["version"])
+                _log("[guncelleme] uygulaniyor:", staged["version"],
+                     staged.get("kind", "installer"), staged.get("files", ""))
                 try:
                     window.load_html(_splash(
-                        "Guncelleme kuruluyor (v%s)..." % staged["version"]))
+                        "Guncelleniyor (v%s)..." % staged["version"]))
                 except Exception:
                     pass
                 if updater.apply_staged_update(staged):
@@ -344,7 +345,7 @@ def main():
                     # yasamasi mumkun degil.
                     time.sleep(2)
                     os._exit(0)
-                _log("[guncelleme] sessiz kurulum baslatilamadi, normal acilis")
+                _log("[guncelleme] baslatilamadi, normal acilis")
                 try:
                     window.load_html(LOADING_HTML)
                 except Exception:

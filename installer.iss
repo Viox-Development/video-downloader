@@ -68,3 +68,9 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\downloads"
+; Yama guncellemesi (updater.py) dosyalari Inno'nun kayit defterine yazmadan
+; degistirir/ekler; kaldirmada geride kalmasinlar.
+Type: filesandordirs; Name: "{app}\_internal"
+Type: filesandordirs; Name: "{app}\ffmpeg"
+Type: filesandordirs; Name: "{app}\jsruntime"
+Type: files; Name: "{app}\update_manifest.json"

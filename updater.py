@@ -10,8 +10,9 @@ Iki ayri guncelleme kanali var:
    klasorden yuklenir ve oradan guncellenir. Boylece uygulamayi yeniden
    derlemeye gerek kalmaz.
 
-2. Uygulama kanali (nadir, ~65 MB)
-   GitHub Releases'teki son surum kontrol edilir, kullaniciya sorulur.
+2. Uygulama kanali
+   GitHub Releases'teki son surum kontrol edilir. Sadece degisen dosyalar
+   indirilir (yama); bkz. "Uygulama guncelleme" bolumu.
 
 DIKKAT: activate() `import yt_dlp` YAPILMADAN ONCE cagrilmalidir. app.py bunu
 kendi ilk satirlarinda yapar.
@@ -22,16 +23,18 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
 import zipfile
+import zlib
 
 APP_VERSION = "1.3.0"
 
-GITHUB_REPO = "hayatexe/video-downloader"
+GITHUB_REPO = "Viox-Development/video-downloader"
 PYPI_YTDLP_JSON = "https://pypi.org/pypi/yt-dlp/json"
 PYPI_EJS_JSON = "https://pypi.org/pypi/yt-dlp-ejs/%s/json"
 GITHUB_LATEST_RELEASE = "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO
@@ -323,35 +326,69 @@ def flag_ytdlp_stale():
 
 # --------------------------------------------------------------------------
 # Uygulama guncelleme (GitHub Releases)
+#
+# Iki yol var:
+#
+# 1. YAMA (varsayilan). Her yayinda iki ek dosya bulunur:
+#      update-manifest.json : kurulumdaki her dosyanin yolu, boyutu, SHA256'si
+#      app-files.zip        : ayni dosyalar, her biri ayri sikistirilmis
+#    Kurulumun icinde de bir update_manifest.json durur. Uygulama ikisini
+#    karsilastirir ve zip'ten SADECE degisen dosyalari HTTP Range ile ceker
+#    (once zip'in sonundaki dizini, sonra her dosyanin kendi bayt araligini).
+#    Tipik bir kod guncellemesinde 80 MB yerine birkac MB iner; Inno Setup
+#    hic calismaz, dosyalar robocopy ile yerine konur, birkac saniye surer.
+#
+# 2. TAM KURULUM (yedek). Yayinda yama dosyalari yoksa, Range desteklenmezse
+#    ya da yama iki kez uygulanamadiysa eski yol: Kurulum.exe indirilir ve
+#    sessiz kurulur.
 # --------------------------------------------------------------------------
 
+MANIFEST_NAME = "update_manifest.json"
+BUNDLE_ASSET = "app-files.zip"
+MANIFEST_ASSET = "update-manifest.json"
+
+# Range isteklerini birlestirme esigi: arka arkaya duran iki degisen dosya
+# arasindaki bosluk bundan kucukse tek istekte cekilir (yt-dlp gibi yuzlerce
+# kucuk dosya degistiginde yuzlerce istek atmamak icin).
+RANGE_MERGE_GAP = 256 * 1024
+
+
 def latest_app_release():
-    """GitHub'daki son surum: (surum, installer_url, sha256_url, notlar)."""
+    """GitHub'daki son surumun bilgileri (sozluk)."""
     data = _get_json(GITHUB_LATEST_RELEASE)
-    tag = (data.get("tag_name") or "").lstrip("vV")
-    url = None
-    sha_url = None
+    rel = {
+        "version": (data.get("tag_name") or "").lstrip("vV"),
+        "notes": data.get("body") or "",
+        "url": None, "sha256_url": None,
+        "manifest_url": None, "bundle_url": None, "bundle_size": 0,
+    }
     for a in data.get("assets", []):
         name = (a.get("name") or "").lower()
-        if name.endswith(".exe") and url is None:
-            url = a.get("browser_download_url")
-        elif "sha256" in name and sha_url is None:
-            sha_url = a.get("browser_download_url")
-    return tag, url, sha_url, data.get("body") or ""
+        link = a.get("browser_download_url")
+        if name.endswith(".exe") and rel["url"] is None:
+            rel["url"] = link
+        elif "sha256" in name and rel["sha256_url"] is None:
+            rel["sha256_url"] = link
+        elif name == MANIFEST_ASSET:
+            rel["manifest_url"] = link
+        elif name == BUNDLE_ASSET:
+            rel["bundle_url"] = link
+            rel["bundle_size"] = int(a.get("size") or 0)
+    return rel
 
 
 def app_update_available():
     """Yeni uygulama surumu varsa bilgi sozlugu, yoksa None."""
     try:
-        tag, url, sha_url, notes = latest_app_release()
+        rel = latest_app_release()
     except Exception:
         return None
-    if not tag or not url:
+    if not rel["version"] or not (rel["url"] or rel["bundle_url"]):
         return None
-    if _version_tuple(tag) <= _version_tuple(APP_VERSION):
+    if _version_tuple(rel["version"]) <= _version_tuple(APP_VERSION):
         return None
-    return {"version": tag, "url": url, "sha256_url": sha_url,
-            "notes": notes, "current": APP_VERSION}
+    rel["current"] = APP_VERSION
+    return rel
 
 
 def _expected_sha256(sha256_url):
@@ -427,18 +464,204 @@ def download_app_installer(url, sha256_url=None, progress=None, dest=None):
     return dest
 
 
+# ---- Yama: zip'ten Range ile dosya cekme ----------------------------------
+
+def app_dir():
+    """Kurulu uygulamanin klasoru (sadece frozen modda)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return None
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_local_manifest(base):
+    try:
+        with open(os.path.join(base, MANIFEST_NAME), "r", encoding="utf-8") as f:
+            return json.load(f).get("files") or {}
+    except Exception:
+        return {}
+
+
+def _get_range(url, start, end, timeout=60):
+    """[start, end] (iki uc dahil) baytlarini getirir.
+
+    GitHub'in indirme sunucusu "bytes=-N" (son N bayt) bicimini desteklemiyor
+    (501 donuyor), bu yuzden her zaman acik aralik istenir. Sunucu Range'i
+    yok sayip tum dosyayi gonderirse (200) hata verilir; yama yolu terk
+    edilir, tam kuruluma dusulur.
+    """
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT, "Range": "bytes=%d-%d" % (start, end)})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        if r.status != 206:
+            raise RuntimeError("sunucu Range desteklemiyor (HTTP %s)" % r.status)
+        data = r.read()
+    if len(data) != end - start + 1:
+        raise RuntimeError("eksik aralik: %d/%d bayt" % (len(data), end - start + 1))
+    return data
+
+
+def _zip_directory(url, size):
+    """Zip'in merkezi dizinini okur: {ad: (yerel_baslik_ofseti, sikisik_boyut, yontem)}."""
+    tail_len = min(size, 66 * 1024)      # EOCD + azami yorum
+    tail = _get_range(url, size - tail_len, size - 1)
+    pos = tail.rfind(b"PK\x05\x06")
+    if pos < 0:
+        raise RuntimeError("zip sonu bulunamadi")
+    cd_size, cd_offset = struct.unpack("<II", tail[pos + 12:pos + 20])
+    if cd_offset == 0xFFFFFFFF:
+        raise RuntimeError("zip64 desteklenmiyor")
+    cd = _get_range(url, cd_offset, cd_offset + cd_size - 1)
+
+    entries = {}
+    i = 0
+    while i + 46 <= len(cd) and cd[i:i + 4] == b"PK\x01\x02":
+        (method, csize, nlen, xlen, clen, lho) = (
+            struct.unpack("<H", cd[i + 10:i + 12])[0],
+            struct.unpack("<I", cd[i + 20:i + 24])[0],
+            struct.unpack("<H", cd[i + 28:i + 30])[0],
+            struct.unpack("<H", cd[i + 30:i + 32])[0],
+            struct.unpack("<H", cd[i + 32:i + 34])[0],
+            struct.unpack("<I", cd[i + 42:i + 46])[0],
+        )
+        name = cd[i + 46:i + 46 + nlen].decode("utf-8")
+        entries[name] = (lho, csize, method)
+        i += 46 + nlen + xlen + clen
+    if not entries:
+        raise RuntimeError("zip dizini bos")
+    return entries, cd_offset
+
+
+def _extract_entry(blob, base, name, csize, method):
+    """blob icinde 'base' ofsetinde duran yerel kaydi acip dosya verisini dondurur."""
+    hdr = blob[base:base + 30]
+    if hdr[:4] != b"PK\x03\x04":
+        raise RuntimeError("bozuk zip kaydi: %s" % name)
+    nlen, xlen = struct.unpack("<HH", hdr[26:30])
+    start = base + 30 + nlen + xlen
+    raw = blob[start:start + csize]
+    if len(raw) != csize:
+        raise RuntimeError("zip kaydi eksik: %s" % name)
+    if method == 0:
+        return raw
+    if method == 8:
+        return zlib.decompress(raw, -15)
+    raise RuntimeError("desteklenmeyen sikistirma (%d): %s" % (method, name))
+
+
+def plan_patch(remote_files, base=None):
+    """Hangi dosyalar inmeli, hangileri silinmeli?
+
+    Yerel dosya, boyutu tutuyor VE (yerel manifestteki hash'i ya da manifest
+    yoksa dosyanin kendi hash'i) uzak hash'le ayniysa atlanir. Silinecekler
+    sadece eski manifestte kayitli olup yenisinde olmayan dosyalardir;
+    kullanicinin klasore koydugu baska bir seye (downloads/ vb.) dokunulmaz.
+    """
+    base = base or app_dir()
+    local = _read_local_manifest(base)
+    need = []
+    for rel, meta in remote_files.items():
+        path = os.path.join(base, *rel.split("/"))
+        try:
+            if os.path.getsize(path) == meta["size"]:
+                known = (local.get(rel) or {}).get("sha256")
+                if known == meta["sha256"]:
+                    continue
+                if not known and _sha256_file(path) == meta["sha256"]:
+                    continue
+        except OSError:
+            pass
+        need.append(rel)
+    delete = sorted(rel for rel in local if rel not in remote_files)
+    return need, delete
+
+
+def download_patch(info, dest_dir, progress=None):
+    """Degisen dosyalari dest_dir/files altina indirip dogrular.
+
+    Dondurur: (indirilen_dosya_sayisi, indirilen_bayt, silinecekler).
+    """
+    base = app_dir()
+    if not base:
+        raise RuntimeError("yama sadece kurulu uygulamada calisir")
+    manifest = _get_json(info["manifest_url"], timeout=30)
+    remote = manifest.get("files") or {}
+    if manifest.get("version") != info["version"] or not remote:
+        raise RuntimeError("manifest surumu uyusmuyor")
+
+    need, delete = plan_patch(remote, base)
+    shutil.rmtree(dest_dir, ignore_errors=True)
+    files_dir = os.path.join(dest_dir, "files")
+    os.makedirs(files_dir, exist_ok=True)
+
+    downloaded = 0
+    if need:
+        entries, cd_offset = _zip_directory(info["bundle_url"], info["bundle_size"])
+        missing = [r for r in need if r not in entries]
+        if missing:
+            raise RuntimeError("zip'te olmayan dosya: %s" % missing[0])
+
+        # Her kaydin bittigi yer = zip'te kendinden sonra gelen kaydin
+        # basladigi yer (son kayit icin merkezi dizinin basi). Yerel baslikta
+        # ekstra alan merkezi dizindekinden farkli olabildigi icin boyutu
+        # buradan hesaplamak en saglami.
+        starts = sorted(lho for lho, _, _ in entries.values())
+        nxt = {s: (starts[k + 1] if k + 1 < len(starts) else cd_offset)
+               for k, s in enumerate(starts)}
+        spans = sorted((entries[r][0], nxt[entries[r][0]], r) for r in need)
+
+        groups = []
+        for s, e, r in spans:
+            if groups and s - groups[-1][1] <= RANGE_MERGE_GAP:
+                groups[-1][1] = max(groups[-1][1], e)
+                groups[-1][2].append(r)
+            else:
+                groups.append([s, e, [r]])
+
+        total = sum(e - s for s, e, _ in groups) or 1
+        for s, e, names in groups:
+            blob = _get_range(info["bundle_url"], s, e - 1, timeout=120)
+            for r in names:
+                lho, csize, method = entries[r]
+                data = _extract_entry(blob, lho - s, r, csize, method)
+                meta = remote[r]
+                if len(data) != meta["size"] or \
+                        hashlib.sha256(data).hexdigest() != meta["sha256"]:
+                    raise RuntimeError("hash uyusmuyor: %s" % r)
+                out = os.path.join(files_dir, *r.split("/"))
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                with open(out, "wb") as f:
+                    f.write(data)
+            downloaded += e - s
+            if progress:
+                progress(downloaded * 100.0 / total)
+
+    # Kurulumdaki manifest de yenilensin (bir sonraki yamanin temeli)
+    with open(os.path.join(files_dir, MANIFEST_NAME), "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+    with open(os.path.join(dest_dir, "delete.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(r.replace("/", "\\") for r in delete))
+    return len(need), downloaded, delete
+
+
 # --------------------------------------------------------------------------
 # Otomatik guncelleme
 #
-# Akis: uygulama acikken yeni surumun kurulumu arka planda indirilir
-# ("staging"). Bir sonraki acilista launcher bunu gorur, sessiz kurulumu
-# baslatip uygulamayi kapatir; kurulum bitince uygulama yeniden acilir.
-# Boylece kullanici hicbir sey onaylamaz, sadece bir sonraki aciliSta
-# birkac saniye fazladan bekler.
+# Akis: uygulama acikken yeni surum arka planda hazirlanir ("staging"):
+# yama ise degisen dosyalar, degilse kurulum dosyasi indirilir. Bir sonraki
+# acilista launcher bunu gorur, uygulamayi kapatip dosyalari yerine koyar ve
+# uygulamayi yeniden acar. Kullanici hicbir sey onaylamaz.
 # --------------------------------------------------------------------------
 
 def updates_dir():
-    """Indirilen kurulum dosyalarinin durdugu klasor."""
+    """Indirilen guncellemelerin durdugu klasor."""
     return os.path.join(user_data_dir(), "updates")
 
 
@@ -454,25 +677,34 @@ def set_auto_update(enabled):
     return bool(enabled)
 
 
+def _remove_path(p):
+    if not p:
+        return
+    if os.path.isdir(p):
+        shutil.rmtree(p, ignore_errors=True)
+    else:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
 def clear_staged_update(remove_file=True):
-    """Hazirlanmis kurulumu unut (ve dosyasini sil)."""
+    """Hazirlanmis guncellemeyi unut (ve dosyalarini sil)."""
     state = _read_state()
     staged = state.pop("staged_update", None)
     state.pop("staged_attempts", None)
     _write_state(state)
     if remove_file and staged:
-        try:
-            os.remove(staged.get("path", ""))
-        except OSError:
-            pass
+        _remove_path(staged.get("path"))
     return staged
 
 
 def staged_update():
-    """Kurulmaya hazir bekleyen guncelleme varsa bilgisini dondurur.
+    """Uygulanmaya hazir bekleyen guncelleme varsa bilgisini dondurur.
 
-    Surum artik eski kaldiysa (ornegin kurulum basarili oldu) ya da dosya
-    kayboldusa kayit temizlenir.
+    Surum artik eski kaldiysa (guncelleme tuttu) ya da dosyalar kayboldusa
+    kayit temizlenir.
     """
     staged = _read_state().get("staged_update")
     if not isinstance(staged, dict):
@@ -482,20 +714,23 @@ def staged_update():
         clear_staged_update()
         return None
     if _version_tuple(version) <= _version_tuple(APP_VERSION):
-        # Kurulum tutmus: dosyayi silip kaydi kapat.
         clear_staged_update()
         return None
-    try:
-        if os.path.getsize(path) < 1024 * 1024:
-            raise OSError
-    except OSError:
+    if staged.get("kind") == "patch":
+        ok = os.path.isfile(os.path.join(path, "files", MANIFEST_NAME))
+    else:
+        try:
+            ok = os.path.getsize(path) >= 1024 * 1024
+        except OSError:
+            ok = False
+    if not ok:
         clear_staged_update()
         return None
     return staged
 
 
 def _prune_updates_dir(keep=None):
-    """updates/ klasorunde sadece guncel kurulum dosyasi kalsin."""
+    """updates/ klasorunde sadece guncel hazirlik kalsin."""
     d = updates_dir()
     if not os.path.isdir(d):
         return
@@ -503,14 +738,19 @@ def _prune_updates_dir(keep=None):
         p = os.path.join(d, name)
         if keep and os.path.abspath(p) == os.path.abspath(keep):
             continue
-        try:
-            os.remove(p)
-        except OSError:
-            pass
+        _remove_path(p)
+
+
+def _patch_possible(info):
+    if not (info.get("manifest_url") and info.get("bundle_url")
+            and info.get("bundle_size") and app_dir() and os.name == "nt"):
+        return False
+    # Bu surumun yamasi daha once iki kez uygulanamadiysa tam kuruluma gec
+    return _read_state().get("patch_failed_version") != info["version"]
 
 
 def stage_app_update(info=None, progress=None, force=False):
-    """Yeni surumun kurulumunu arka planda indirip bir sonraki acilisa hazirla.
+    """Yeni surumu arka planda indirip bir sonraki acilisa hazirla.
 
     Dondurur: hazirlanan guncelleme sozlugu ya da None.
     """
@@ -518,8 +758,7 @@ def stage_app_update(info=None, progress=None, force=False):
     now = time.time()
     if info is None:
         if not force and now - state.get("app_checked_at", 0) < APP_CHECK_INTERVAL:
-            existing = staged_update()
-            return existing
+            return staged_update()
         info = app_update_available()
         state = _read_state()
         state["app_checked_at"] = now
@@ -531,29 +770,97 @@ def stage_app_update(info=None, progress=None, force=False):
     if existing and existing.get("version") == info["version"]:
         return existing
 
-    dest = os.path.join(updates_dir(),
-                        "VideoDownloaderSetup-%s.exe" % info["version"])
-    path = download_app_installer(info["url"], info.get("sha256_url"),
-                                  progress=progress, dest=dest)
-    _prune_updates_dir(keep=path)
+    record = None
+    if _patch_possible(info):
+        dest = os.path.join(updates_dir(), "patch-%s" % info["version"])
+        try:
+            count, nbytes, delete = download_patch(info, dest, progress=progress)
+            record = {"kind": "patch", "path": dest, "files": count,
+                      "bytes": nbytes, "deleted": len(delete)}
+        except Exception as e:
+            _remove_path(dest)
+            state = _read_state()
+            state["last_patch_error"] = "%s: %s" % (info["version"], e)
+            fails = state.get("patch_dl_failures") or {}
+            fails = {info["version"]: int(fails.get(info["version"], 0)) + 1}
+            state["patch_dl_failures"] = fails
+            if fails[info["version"]] >= MAX_INSTALL_ATTEMPTS:
+                # Ust uste inemedi (Range'i engelleyen proxy vb.): bu surum
+                # icin tam kuruluma gec ki kullanici guncellemesiz kalmasin.
+                state["patch_failed_version"] = info["version"]
+            _write_state(state)
+            if fails[info["version"]] < MAX_INSTALL_ATTEMPTS:
+                # Gecici ag hatasi olabilir: 80 MB'a hemen dusme, bir
+                # sonraki kontrolde yamayi tekrar dene.
+                raise
+            record = None
+    if record is None:
+        if not info.get("url"):
+            return None
+        dest = os.path.join(updates_dir(),
+                            "VideoDownloaderSetup-%s.exe" % info["version"])
+        path = download_app_installer(info["url"], info.get("sha256_url"),
+                                      progress=progress, dest=dest)
+        record = {"kind": "installer", "path": path}
+    _prune_updates_dir(keep=record["path"])
 
     state = _read_state()
-    state["staged_update"] = {
+    record.update({
         "version": info["version"],
-        "path": path,
         "notes": (info.get("notes") or "")[:2000],
         "staged_at": now,
-    }
+    })
+    state["staged_update"] = record
     state["staged_attempts"] = 0
     _write_state(state)
-    return state["staged_update"]
+    return record
+
+
+# Yamayi uygulayan betik. Calisan exe ve _internal'daki DLL'ler kilitli
+# oldugu icin dosyalari uygulama kapandiktan SONRA ayri bir surec koyar.
+# Yollar ortam degiskenleriyle gelir: Turkce karakterli kullanici klasorleri
+# (C:\Users\Şule) cmd betiginin kod sayfasina takilmasin.
+#  * Once exe HARIC her sey kopyalanir, en son exe. Ilk adim yarida kalirsa
+#    eski exe yerinde kalir; surum eski gorunur ve yama tekrar denenir.
+#  * robocopy cikis kodu 8 ve uzeri hata demek (0-7 basari cesitleri).
+#  * Kurulu programlar listesindeki surum de guncellenir.
+_APPLY_CMD = r"""@echo off
+setlocal
+:wait
+tasklist /FI "PID eq %VD_PID%" /NH 2>nul | find " %VD_PID% " >nul
+if not errorlevel 1 (
+  ping -n 2 127.0.0.1 >nul
+  goto wait
+)
+robocopy "%VD_SRC%" "%VD_APP%" /E /XF "%VD_EXE_NAME%" /R:15 /W:1 /NP /NJH /NJS /NFL /NDL >nul
+if errorlevel 8 goto fail
+if exist "%VD_SRC%\%VD_EXE_NAME%" (
+  robocopy "%VD_SRC%" "%VD_APP%" "%VD_EXE_NAME%" /R:15 /W:1 /NP /NJH /NJS /NFL /NDL >nul
+  if errorlevel 8 goto fail
+)
+for /f "usebackq delims=" %%F in ("%VD_DELETE%") do if exist "%VD_APP%\%%F" del /f /q "%VD_APP%\%%F"
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{9C4E6A2F-3B7D-4E8A-9F1C-2B8D51E04A67}_is1" /v DisplayVersion /d "%VD_VERSION%" /f >nul 2>&1
+echo ok> "%VD_RESULT%"
+goto relaunch
+:fail
+echo fail> "%VD_RESULT%"
+:relaunch
+start "" "%VD_APP%\%VD_EXE_NAME%"
+"""
+
+
+def _spawn_detached(args, env=None):
+    flags = 0
+    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+        flags |= getattr(subprocess, name, 0)
+    subprocess.Popen(args, creationflags=flags, close_fds=True, env=env)
 
 
 def apply_staged_update(staged=None, relaunch_exe=None):
-    """Sessiz kurulumu baslatir. True donerse uygulama HEMEN kapanmalidir.
+    """Bekleyen guncellemeyi uygulatir. True donerse uygulama HEMEN kapanmalidir.
 
-    Kurulum sihirbazi uygulamanin dosyalarini degistirecegi icin surec
-    hayatta kalamaz; kurulum bitince uygulama yeniden baslatilir.
+    Dosyalari ayri bir surec degistirir (uygulama acikken kilitliler); is
+    bitince uygulama yeniden baslatilir.
     """
     staged = staged or staged_update()
     if not staged or os.name != "nt":
@@ -562,33 +869,53 @@ def apply_staged_update(staged=None, relaunch_exe=None):
     state = _read_state()
     attempts = int(state.get("staged_attempts", 0))
     if attempts >= MAX_INSTALL_ATTEMPTS:
-        # Iki kez denendi ve surum hala eski: otomatik kurulum bu surumde
-        # calismiyor. Acilis dongusune girmemek icin vazgec, kullanici
-        # Ayarlar'dan elle kurabilir.
+        if staged.get("kind") == "patch":
+            # Yama iki kez tutmadi: bu surum icin tam kuruluma gec. Bir
+            # sonraki kontrol Kurulum.exe'yi hazirlar.
+            state["patch_failed_version"] = staged["version"]
+            state["app_checked_at"] = 0
+            _write_state(state)
+            clear_staged_update()
+        # Kurulum da iki kez tutmadiysa acilis dongusune girmemek icin
+        # vazgec; kullanici Ayarlar'dan elle kurabilir.
         return False
     state["staged_attempts"] = attempts + 1
     _write_state(state)
 
-    installer = staged["path"]
     exe = relaunch_exe
     if exe is None and getattr(sys, "frozen", False):
         exe = sys.executable
 
-    # cmd /c: kurulum bitene kadar bekler, sonra uygulamayi yeniden acar.
-    # "&" kullaniliyor ki kurulum basarisiz olsa bile uygulama geri gelsin.
-    cmdline = '"%s" %s' % (installer, " ".join(SILENT_FLAGS))
-    if exe:
-        cmdline += ' & start "" "%s"' % exe
-
-    flags = 0
-    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
-        flags |= getattr(subprocess, name, 0)
     try:
-        subprocess.Popen(["cmd", "/c", cmdline], creationflags=flags,
-                         close_fds=True)
+        if staged.get("kind") == "patch":
+            if not exe:
+                return False
+            path = staged["path"]
+            script = os.path.join(path, "apply.cmd")
+            with open(script, "w", encoding="ascii", newline="\r\n") as f:
+                f.write(_APPLY_CMD)
+            env = dict(os.environ)
+            env.update({
+                "VD_PID": str(os.getpid()),
+                "VD_SRC": os.path.join(path, "files"),
+                "VD_APP": os.path.dirname(os.path.abspath(exe)),
+                "VD_EXE_NAME": os.path.basename(exe),
+                "VD_DELETE": os.path.join(path, "delete.txt"),
+                "VD_RESULT": os.path.join(path, "result.txt"),
+                "VD_VERSION": staged["version"],
+            })
+            _spawn_detached(["cmd", "/c", script], env=env)
+            return True
+
+        # Tam kurulum: cmd /c kurulum bitene kadar bekler, sonra uygulamayi
+        # yeniden acar. "&": kurulum basarisiz olsa bile uygulama geri gelsin.
+        cmdline = '"%s" %s' % (staged["path"], " ".join(SILENT_FLAGS))
+        if exe:
+            cmdline += ' & start "" "%s"' % exe
+        _spawn_detached(["cmd", "/c", cmdline])
+        return True
     except Exception:
         return False
-    return True
 
 
 # --------------------------------------------------------------------------
