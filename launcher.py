@@ -326,7 +326,34 @@ def setup_tray(window, api):
     threading.Thread(target=icon.run, daemon=True).start()
     return icon
 
+def _wait_for_previous_instance():
+    """Guncelleme sonrasi yeniden baslatmada: eski surum kapanana kadar bekle.
+
+    Yama uygulandiktan sonra eski surec yeni exe'yi "--wait-pid <pid>" ile
+    baslatip kapanir. Beklemezsek tek-ornek kilidi (mutex) hala eski surecte
+    oldugu icin yeni surum "zaten acik" deyip kendini kapatir.
+    """
+    if "--wait-pid" not in sys.argv:
+        return
+    try:
+        pid = int(sys.argv[sys.argv.index("--wait-pid") + 1])
+    except (ValueError, IndexError):
+        return
+    try:
+        import ctypes
+        SYNCHRONIZE = 0x00100000
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(SYNCHRONIZE, False, pid)
+        if h:
+            k32.WaitForSingleObject(h, 20000)
+            k32.CloseHandle(h)
+    except Exception as e:
+        _log("[guncelleme] eski surec beklenemedi:", repr(e))
+    _log("[guncelleme] yeni surum acildi")
+
+
 def main():
+    _wait_for_previous_instance()
     if already_running_focus_existing():
         return
 
@@ -362,6 +389,13 @@ def main():
         #    yeniden acilir. Kullaniciya hicbir sey sorulmaz.
         try:
             import updater
+            removed = updater.cleanup_old_files()
+            if removed:
+                _log("[guncelleme] eski surumden kalan dosya silindi:", removed)
+        except Exception as e:
+            _log("[guncelleme] eski dosya temizligi atlandi:", repr(e))
+        try:
+            import updater
             staged = updater.staged_update() if updater.get_auto_update() else None
             if staged:
                 _log("[guncelleme] uygulaniyor:", staged["version"],
@@ -372,9 +406,10 @@ def main():
                 except Exception:
                     pass
                 if updater.apply_staged_update(staged):
-                    # Kurulum sihirbazi dosyalari degistirecek; surecin
-                    # yasamasi mumkun degil.
-                    time.sleep(2)
+                    # Yama: dosyalar yerinde, yeni surum bizim kapanmamizi
+                    # bekliyor. Kurulum: sihirbaz dosyalari degistirecek.
+                    _log("[guncelleme] uygulandi, yeniden baslatiliyor")
+                    time.sleep(0.5 if staged.get("kind") == "patch" else 2)
                     os._exit(0)
                 _log("[guncelleme] baslatilamadi, normal acilis")
                 try:
