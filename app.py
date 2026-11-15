@@ -529,6 +529,8 @@ TIKTOK_API_HOSTS = [
 ]
 _working_tiktok_host = None
 
+PLAYLIST_MAX_ITEMS = 2000
+
 
 def _is_tiktok_url(url):
     return re.search(r'(?://|\.)tiktok\.com/', url or "", re.IGNORECASE) is not None
@@ -1176,8 +1178,12 @@ def get_video_info():
             if not entries:
                 return jsonify({"error": "Playlist boş"}), 400
             
-            # Aşırı beklemeyi engellemek için maks 200 video ile sınırla
-            for idx, entry in enumerate(entries[:200]):
+            # Buraya gelindiginde yt-dlp listenin tamamini zaten cekmis
+            # oluyor (extract_flat); kesmek bekleme kazandirmiyor, sadece
+            # listenin sonunu gizliyordu (437 videoluk TikTok koleksiyonunda
+            # 237 video hic gorunmuyordu). Tavan yalnizca bozuk/bitmeyen bir
+            # listenin arayuzu kilitlememesi icin.
+            for idx, entry in enumerate(entries[:PLAYLIST_MAX_ITEMS]):
                 if entry:
                     item_url = entry.get("url") or entry.get("webpage_url") or url
                     # YouTube'da bazen sadece ID gelir, URL oluştur:
