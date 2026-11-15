@@ -534,6 +534,46 @@ def _is_tiktok_url(url):
     return re.search(r'(?://|\.)tiktok\.com/', url or "", re.IGNORECASE) is not None
 
 
+def _is_tiktok_collection_url(url):
+    return re.search(r'(?://|\.)tiktok\.com/@[^/]+/collection/', url or "",
+                     re.IGNORECASE) is not None
+
+
+# yt-dlp koleksiyon icin web API'sini (api/collection/item_list) dogrudan
+# cagiriyor, once sayfayi ziyaret etmiyor. TikTok bazi bolgelerde/aglarda
+# ttwid gibi oturum cerezi olmayan istege BOS govde donuyor; yt-dlp bunu
+# "Failed to parse JSON ... Expecting value: line 1 column 1" diye raporluyor.
+# Ayni durumun ikinci hali: gecerli JSON ama itemList yok (statusCode 100001),
+# o zaman liste bos geliyor.
+TIKTOK_EMPTY_COLLECTION = "TikTok koleksiyonu boş döndü (tiktok-collection-empty)"
+
+
+def _is_tiktok_list_error(msg):
+    m = str(msg).lower()
+    return any(k in m for k in (
+        "failed to parse json", "jsondecodeerror", "expecting value",
+        "tiktok-collection-empty",
+    ))
+
+
+def _seed_tiktok_cookies(ydl, url):
+    """Koleksiyon sayfasini ayni YoutubeDL oturumunda ac.
+
+    Cevaptaki ttwid / tt_csrf_token / tt_chain_token cerezleri ydl'in cerez
+    kavanozuna duser; yt-dlp'nin hemen ardindan yaptigi API istegi bunlari
+    tasir ve TikTok bos govde yerine gercek listeyi dondurur.
+    """
+    try:
+        from yt_dlp.networking import Request
+        ext = {}
+        if has_impersonate_support():
+            from yt_dlp.networking.impersonate import ImpersonateTarget
+            ext["impersonate"] = ImpersonateTarget.from_str("chrome")
+        ydl.urlopen(Request(url, extensions=ext)).read()
+    except Exception as e:
+        _log_attempt(url, "tiktok-cerez-tohumu", e)
+
+
 def _is_extractor_response_error(msg):
     """TikTok'un web sayfasindan gecerli veri alinamadigini gosteren hata."""
     m = str(msg).lower()
@@ -669,7 +709,19 @@ def extract_with_cookie_fallback(url, base_opts, browser_pref="auto", download=F
         attempts.append((None, {"js_runtimes": js_rt, "_only_if_formats_missing": True}))
     # TikTok'ta web sayfasi cikarimi sik sik bloke oluyor; cerezlerden once
     # mobil API sunucularini dene.
-    tiktok_attempts = _tiktok_host_attempts() if _is_tiktok_url(url) else []
+    # Koleksiyon cikarimi api_hostname'i kullanmiyor (web API'si), o
+    # denemeler orada bosuna bekletir. Yerine: once sayfayi ziyaret edip
+    # cerez topla, sonra ayni oturumda listeyi iste.
+    is_tt_collection = _is_tiktok_collection_url(url)
+    if is_tt_collection:
+        tiktok_attempts = []
+        seed = {"_seed_tiktok": True, "_only_if_tiktok_list": True}
+        if has_impersonate_support():
+            from yt_dlp.networking.impersonate import ImpersonateTarget
+            seed["impersonate"] = ImpersonateTarget.from_str("chrome")
+        attempts.append((None, seed))
+    else:
+        tiktok_attempts = _tiktok_host_attempts() if _is_tiktok_url(url) else []
     attempts += [(None, extra) for extra in tiktok_attempts]
     if browser_pref != "off":
         # 1. Uygulama ici giris penceresinden kaydedilen cerezler (en guvenilir)
@@ -702,6 +754,9 @@ def extract_with_cookie_fallback(url, base_opts, browser_pref="auto", download=F
         extra = dict(extra)
         if extra.pop("_only_if_formats_missing", False) and not _is_formats_missing(last_err):
             continue
+        if extra.pop("_only_if_tiktok_list", False) and not _is_tiktok_list_error(last_err):
+            continue
+        seed_tiktok = extra.pop("_seed_tiktok", False)
         ssl_label = extra.pop("_label", None)
         only_if_ssl = extra.pop("_only_if_ssl", False)
         if only_if_ssl and not _is_ssl_error(last_err):
@@ -730,7 +785,18 @@ def extract_with_cookie_fallback(url, base_opts, browser_pref="auto", download=F
         for deneme in range(TRANSIENT_RETRIES + 1):
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
+                    if seed_tiktok:
+                        _seed_tiktok_cookies(ydl, url)
                     info = ydl.extract_info(url, download=download)
+                if is_tt_collection and info:
+                    entries = info.get("entries")
+                    if entries is not None and not isinstance(entries, list):
+                        entries = info["entries"] = list(entries)
+                    if not entries:
+                        # Engellenen istek bos liste olarak da donebiliyor;
+                        # "Playlist bos" deyip birakmak yerine siradaki
+                        # yolu (cerez tohumu, giris cerezi, tarayici) dene.
+                        raise yt_dlp.utils.DownloadError(TIKTOK_EMPTY_COLLECTION)
                 if name:
                     _working_cookie_browser = name
                 host = (extra.get("extractor_args", {})
@@ -759,6 +825,8 @@ def extract_with_cookie_fallback(url, base_opts, browser_pref="auto", download=F
             cookiefile_err = e
         elif "extractor_args" in extra:
             label = "tiktok-api"
+        elif seed_tiktok:
+            label = "tiktok-cerez-tohumu+liste"
         elif "js_runtimes" in extra:
             label = "cerezsiz+js"
         else:
@@ -777,6 +845,7 @@ def extract_with_cookie_fallback(url, base_opts, browser_pref="auto", download=F
         # DISINDA bir hata verdiyse yeniden denemenin anlami yok.
         if not extra and not _is_login_error(e) and not (
             tiktok_attempts and _is_extractor_response_error(e)
+        ) and not (is_tt_collection and _is_tiktok_list_error(e)
         ) and not (js_rt and _is_formats_missing(e)) and not _is_ssl_error(e):
             # Duz "raise" burada yanlis: istisna yukaridaki ic dongude
             # yakalanip err'e alindi, artik aktif bir istisna yok. Duz
@@ -939,6 +1008,14 @@ def friendly_error(error_msg, url=""):
     if "tarayıcı taklidi" in msg:
         # extract_with_cookie_fallback'in kendi mesaji; oldugu gibi gecsin
         return msg, {}
+    if _is_tiktok_collection_url(url) and _is_tiktok_list_error(msg):
+        # Cerezsiz, cerez tohumlu ve (varsa) giris cerezli denemelerin hepsi
+        # bos dondu. Koleksiyon gizliyse ya da TikTok bu agdan girissiz
+        # istegi kabul etmiyorsa giris cozer.
+        info = detect_login_platform(url)
+        return ("TikTok bu koleksiyonun listesini vermedi. Koleksiyon gizli "
+                "olabilir ya da TikTok girişsiz isteği reddediyor; TikTok "
+                "hesabınızla giriş yapıp tekrar deneyin.", _login_payload(info))
     if _is_login_error(msg):
         info = detect_login_platform(url)
         return (f"Bu içerik {info['platform']} girişi gerektiriyor.",
